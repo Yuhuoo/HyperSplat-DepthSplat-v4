@@ -71,6 +71,15 @@ def train(cfg_dict: DictConfig):
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
 
+    test_difix = cfg.mode == "test" and cfg.test.difix.enabled
+    if test_difix:
+        if cfg.train.forward_depth_only or cfg.model.encoder.train_depth_only:
+            raise ValueError("Difix-ref requires RGB rendering.")
+        if cfg.test.compute_scores and cfg.test.stablize_camera:
+            raise ValueError("Difix-ref scores require test.stablize_camera=false to match GT poses.")
+        if cfg.trainer.num_nodes != 1:
+            raise ValueError("Difix-ref evaluation requires trainer.num_nodes=1.")
+
     # Set up the output directory.
     if cfg_dict.output_dir is None:
         output_dir = Path(
@@ -132,12 +141,13 @@ def train(cfg_dict: DictConfig):
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
 
+    devices = 1 if test_difix else torch.cuda.device_count()
     trainer = Trainer(
         max_epochs=-1,
         accelerator="gpu",
         logger=logger,
-        devices=torch.cuda.device_count(),
-        strategy='ddp' if torch.cuda.device_count() > 1 else "auto",
+        devices=devices,
+        strategy="ddp" if devices > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
         enable_progress_bar=cfg.mode == "test",

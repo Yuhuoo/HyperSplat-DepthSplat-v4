@@ -83,6 +83,13 @@ test:
   render_chunk_size: null
   stablize_camera: false
   stab_camera_kernel: 50
+  difix:
+    enabled: false
+    model_path: nvidia/difix_ref
+    repo_path: ../Difix3D
+    local_files_only: false
+    fp16: true
+    max_side: null
 
 seed: 111123
 

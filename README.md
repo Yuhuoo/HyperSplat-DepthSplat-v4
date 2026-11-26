@@ -213,6 +213,30 @@ https://github.com/user-attachments/assets/ea6d3b9c-af80-43e6-9a12-36c67e874366
 
 ### Evaluation
 
+#### Evaluate with Difix-ref
+
+From the DepthSplat directory, install the optional dependencies into the existing environment:
+
+```bash
+pip install -r requirements-difix.txt
+```
+
+Add `test.difix.enabled=true` to a DepthSplat evaluation command. Point `test.difix.model_path` to the downloaded `nvidia/difix_ref` Diffusers model directory containing `model_index.json` and the model components. The default `test.difix.repo_path=../Difix3D` locates the sibling checkout. For example, for the small two-view RealEstate10K model:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=re10k \
+    mode=test dataset/view_sampler=evaluation dataset.test_chunk_interval=1 \
+    model.encoder.upsample_factor=4 model.encoder.lowest_feature_resolution=4 \
+    checkpointing.pretrained_model=pretrained/depthsplat-gs-small-re10k-256x256-view2-cfeab6b1.pth \
+    test.difix.enabled=true test.difix.model_path=/path/to/difix_ref \
+    test.difix.local_files_only=true test.save_image=true test.save_gt_image=true \
+    output_dir=outputs/re10k-difix-ref
+```
+
+Difix-ref uses one context image per target, selected by camera center distance plus relative rotation angle in radians. Frames that also appear in the context are excluded from both sets of scores. The paired results in `metrics/scores_all_avg.json` include the original `psnr`, `ssim`, and `lpips`, the repaired `*_difix_ref`, and `*_delta` (repaired minus original). Scores retain the existing scene averaging, and the summary reports the number of scored and excluded views. With `test.save_image=true`, repaired PNGs have a `_difix_ref` suffix alongside the original renders.
+
+The Difix-ref test uses one GPU. For large frames, `test.difix.max_side=512` caps the diffusion input resolution and returns the result at the original rendering size for scoring. To use full precision, set `test.difix.fp16=false`.
+
 
 
 #### RealEstate10K

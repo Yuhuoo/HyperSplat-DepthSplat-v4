@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
@@ -42,6 +42,7 @@ from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode, DecoderOutput
+from .difix_ref import DifixRefCfg, DifixRefiner, select_reference_views
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from src.visualization.vis_depth import viz_depth_tensor
@@ -74,6 +75,7 @@ class TestCfg:
     render_chunk_size: int | None
     stablize_camera: bool
     stab_camera_kernel: int
+    difix: DifixRefCfg = field(default_factory=DifixRefCfg)
 
 
 @dataclass
@@ -148,6 +150,7 @@ class ModelWrapper(LightningModule):
         # This is used for testing.
         self.benchmarker = Benchmarker()
         self.eval_cnt = 0
+        self.difix_refiner: DifixRefiner | None = None
 
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
@@ -358,6 +361,21 @@ class ModelWrapper(LightningModule):
 
         return total_loss
 
+    def on_test_start(self) -> None:
+        if self.test_cfg.difix.enabled:
+            self.difix_refiner = DifixRefiner(self.test_cfg.difix, self.device, get_cfg()["seed"])
+            self.test_context_views_excluded = 0
+            self.test_scored_views = 0
+            self.test_scored_scenes = 0
+            if self.test_cfg.compute_scores:
+                self.time_skip_steps_dict["difix_ref"] = 0
+
+    def record_test_scores(self, gt: Tensor, rgb: Tensor, suffix: str = "", chunk_size: int | None = None) -> None:
+        chunk_size = gt.shape[0] if chunk_size is None else chunk_size
+        for name, compute in (("psnr", compute_psnr), ("ssim", compute_ssim), ("lpips", compute_lpips)):
+            scores = [compute(targets, renders) for targets, renders in zip(gt.split(chunk_size), rgb.split(chunk_size))]
+            self.test_step_outputs.setdefault(name + suffix, []).append(torch.cat(scores).mean().item())
+
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
@@ -527,6 +545,19 @@ class ModelWrapper(LightningModule):
 
         images_prob = output.color[0]
         rgb_gt = batch["target"]["image"][0]
+        images_difix = None
+        if self.difix_refiner is not None:
+            target_indices = batch["target"]["index"][0]
+            reference_indices, novel_targets = select_reference_views(
+                batch["context"]["extrinsics"][0],
+                camera_poses[0],
+                batch["context"]["index"][0],
+                target_indices,
+            )
+            torch.cuda.synchronize(self.device)
+            with self.benchmarker.time("difix_ref", num_calls=v):
+                images_difix = self.difix_refiner(images_prob, batch["context"]["image"][0], reference_indices)
+                torch.cuda.synchronize(self.device)
 
         # Save images.
         if self.test_cfg.save_image:
@@ -539,6 +570,9 @@ class ModelWrapper(LightningModule):
             else:
                 for index, color in zip(batch["target"]["index"][0], images_prob):
                     save_image(color, path / "images" / scene / f"color/{index:0>6}.png")
+            if images_difix is not None:
+                for index, color in zip(target_indices, images_difix):
+                    save_image(color, path / "images" / scene / f"color/{index:0>6}_difix_ref.png")
 
         # save video
         if self.test_cfg.save_video:
@@ -547,32 +581,33 @@ class ModelWrapper(LightningModule):
                 [a for a in images_prob],
                 path / "videos" / f"{scene}_frame_{frame_str}.mp4",
             )
+            if images_difix is not None:
+                save_video(
+                    list(images_difix),
+                    path / "videos" / f"{scene}_frame_{frame_str}_difix_ref.mp4",
+                )
 
         # compute scores
         if self.test_cfg.compute_scores:
             if batch_idx < self.test_cfg.eval_time_skip_steps:
                 self.time_skip_steps_dict["encoder"] += 1
                 self.time_skip_steps_dict["decoder"] += v
+                if images_difix is not None:
+                    self.time_skip_steps_dict["difix_ref"] += v
 
-            if not self.train_cfg.forward_depth_only:
-                rgb = images_prob
-
-                if f"psnr" not in self.test_step_outputs:
-                    self.test_step_outputs[f"psnr"] = []
-                if f"ssim" not in self.test_step_outputs:
-                    self.test_step_outputs[f"ssim"] = []
-                if f"lpips" not in self.test_step_outputs:
-                    self.test_step_outputs[f"lpips"] = []
-
-                self.test_step_outputs[f"psnr"].append(
-                    compute_psnr(rgb_gt, rgb).mean().item()
-                )
-                self.test_step_outputs[f"ssim"].append(
-                    compute_ssim(rgb_gt, rgb).mean().item()
-                )
-                self.test_step_outputs[f"lpips"].append(
-                    compute_lpips(rgb_gt, rgb).mean().item()
-                )
+            if images_difix is None:
+                self.record_test_scores(rgb_gt, images_prob)
+            else:
+                # Both predictions use exactly the same held-out targets and GT.
+                num_novel = int(novel_targets.sum().item())
+                self.test_context_views_excluded += v - num_novel
+                if num_novel > 0:
+                    self.test_scored_views += num_novel
+                    self.test_scored_scenes += 1
+                    gt = rgb_gt[novel_targets]
+                    chunk_size = self.test_cfg.render_chunk_size or 8
+                    self.record_test_scores(gt, images_prob[novel_targets], chunk_size=chunk_size)
+                    self.record_test_scores(gt, images_difix[novel_targets], "_difix_ref", chunk_size=chunk_size)
 
     def on_test_end(self) -> None:
         out_dir = Path(self.test_cfg.output_path)
@@ -591,11 +626,22 @@ class ModelWrapper(LightningModule):
 
             for tag, times in self.benchmarker.execution_times.items():
                 times = times[int(self.time_skip_steps_dict[tag]) :]
-                saved_scores[tag] = [len(times), np.mean(times)]
-                print(
-                    f"{tag}: {len(times)} calls, avg. {np.mean(times)} seconds per call"
-                )
+                avg_time = float(np.mean(times)) if times else None
+                saved_scores[tag] = [len(times), avg_time]
+                print(f"{tag}: {len(times)} calls, avg. {avg_time} seconds per call")
                 self.time_skip_steps_dict[tag] = 0
+
+            if self.test_cfg.difix.enabled:
+                for metric in ("psnr", "ssim", "lpips"):
+                    if metric in saved_scores:
+                        delta = saved_scores[f"{metric}_difix_ref"] - saved_scores[metric]
+                        saved_scores[f"{metric}_delta"] = delta
+                        print(f"{metric}_delta {delta:+.6f}")
+                saved_scores["scored_scenes"] = self.test_scored_scenes
+                saved_scores["scored_views"] = self.test_scored_views
+                saved_scores["context_views_excluded"] = self.test_context_views_excluded
+                print(f"Scored {self.test_scored_views} novel views in {self.test_scored_scenes} scenes; "
+                      f"excluded {self.test_context_views_excluded} context views.")
 
             with (out_dir / f"scores_all_avg.json").open("w") as f:
                 json.dump(saved_scores, f)
@@ -604,6 +650,7 @@ class ModelWrapper(LightningModule):
             self.benchmarker.dump(out_dir / "benchmark.json")
             self.benchmarker.dump_memory(out_dir / "peak_memory.json")
             self.benchmarker.summarize()
+        self.difix_refiner = None
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx):
